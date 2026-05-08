@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Bot runtime files (generated, not committed)
+startup_error.log
+je_bot_errors.log
+je_bot_config.json
+
+# Compiled bytecode
+je_bot_cpython-*.pyc
+
+# PDF files (may contain sensitive financial data)
+*.pdf
+
+# Excel files (may contain sensitive financial data)
+*.xlsx
+*.xls
+
+# CSV exports
+*.csv
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
