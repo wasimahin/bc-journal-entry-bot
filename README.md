@@ -1,7 +1,7 @@
 # BC Journal Entry Bot
 
-> **Production automation tool built for Associated Students, Inc. (ASI) at California State University, Long Beach.**  
-> Reduces journal entry processing time by **70–95%** depending on entry complexity.
+> **Production Python desktop automation tool built for Associated Students, Inc. (ASI) at California State University, Long Beach.**  
+> Reduces journal entry processing time by **up to 95%** — live in production with zero API integration.
 
 ---
 
@@ -19,26 +19,26 @@ Previously, manually entering a multi-line journal entry required navigating Bus
 
 | Metric | Before | After |
 |---|---|---|
-| Entry time (simple 2-line JE) | ~2 min | ~5 sec |
-| Entry time (multi-line JE) | ~10–15 min | ~30–60 sec |
-| Processing time reduction | — | **70–95%** |
+| Entry time (simple 2-line JE) | ~2 minutes | ~5 seconds |
+| Entry time (multi-line JE) | ~10–15 minutes | ~30–60 seconds |
+| Processing time reduction | — | **Up to 95%** |
 | Manual keystrokes per entry | 100–300+ | ~3 (load, verify, ALT+F8) |
 
 ---
 
 ## Features
 
-- **PDF Parsing** — Reads page 1 of DocuSign JE PDFs using layout-preserving extraction (`pdfplumber`, `PyMuPDF`). Handles simple 2-line transfers and multi-line entries with complex object code formats (`A5106-0`, `G70-8423-0`, `6440-7103-G60-5484-0`).
-- **Excel Support** — Attaches CashNet XLSX detail files (`openpyxl`) when first-page data is insufficient. Positive = Debit, Negative/Parenthetical = Credit.
-- **Live PDF Preview** — Renders page 1 of the loaded PDF directly in the UI using PyMuPDF.
-- **Editable Journal Table** — Review, edit, add, delete, or swap debit/credit lines before entry.
-- **Balance Validation** — Real-time ✓ BALANCED / Δ unbalanced indicator with debit/credit totals.
-- **ALT+F8 Hotkey** — Start or stop Business Central entry from anywhere on the screen.
-- **Immediate Entry** — No countdown, no confirmation prompt. Starts instantly.
-- **Object Code Normalization** — Automatically cleans trailing zero variants (`-00` → `-0`, `-02` → `-2`).
-- **Configurable Tab Offset** — Adjustable tabs after Object Code field to match Business Central layout.
-- **CSV Export** — Export parsed lines to CSV for audit or review.
-- **Activity Log** — Color-coded in-app log for every parse, entry, and error event.
+- **PDF Parsing** — Reads page 1 of DocuSign JE PDFs using layout-preserving extraction (`pdfplumber`, `PyMuPDF`). Handles simple 2-line transfers and multi-line entries with complex object code formats (`A5106-0`, `G70-8423-0`, `6440-7103-G60-5484-0`)
+- **Excel Support** — Attaches CashNet XLSX detail files (`openpyxl`) when first-page data is insufficient. Positive = Debit, Negative/Parenthetical = Credit
+- **Live PDF Preview** — Renders page 1 of the loaded PDF directly in the UI using PyMuPDF
+- **Editable Journal Table** — Review, edit, add, delete, or swap debit/credit lines before entry
+- **Balance Validation** — Real-time ✓ BALANCED / Δ unbalanced indicator with debit/credit totals
+- **ALT+F8 Hotkey** — Start or stop Business Central entry from anywhere on screen
+- **Immediate Entry** — No countdown, no confirmation prompt. Starts instantly
+- **Object Code Normalization** — Automatically cleans trailing zero variants (`-00` → `-0`, `-02` → `-2`)
+- **Configurable Tab Offset** — Adjustable tabs after Object Code field to match Business Central layout
+- **CSV Export** — Export parsed lines to CSV for audit or review
+- **Activity Log** — Color-coded in-app log for every parse, entry, and error event
 
 ---
 
@@ -105,7 +105,7 @@ python je_bot.py
 
 ## Excel Rules (ATTACH XLSX mode)
 
-When the PDF's first page is insufficient (indicated in the UI), attach the CashNet Excel detail file:
+When the PDF's first page is insufficient, attach the CashNet Excel detail file:
 
 - **Positive amount** → Debit
 - **Negative amount** or **parentheses** → Credit
@@ -136,7 +136,7 @@ When the PDF's first page is insufficient (indicated in the UI), attach the Cash
 
 ## Project Context
 
-Built independently as part of my role as **Lead Business Office Representative at ASI CSULB**, where I manage financial documentation for 500+ registered campus organizations. This tool is one of two production Python automation tools I engineered for the office — the other being the **Snehin Check Request Helper** ([repo link here](https://github.com/wasimahin/snehin-check-request-helper)).
+Built independently as part of my role as **Lead Business Office Representative at ASI CSULB**, where I oversee financial documentation for 500+ registered campus organizations. This tool is one of two production Python automation systems I engineered for the office — the other being the **[Snehin Check Request Helper](https://github.com/wasimahin/snehin-check-request-helper)**.
 
 Both tools run live with zero API integration, operating entirely through UI automation against Microsoft Dynamics 365 Business Central.
 
