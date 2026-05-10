@@ -1,0 +1,1338 @@
+#!/usr/bin/env python3
+"""
+BC Journal Entry Bot - polished edition
+- Parses first page of JE PDFs using layout-preserving extraction
+- If first page is insufficient, user can attach XLSX detail file
+- Immediate F8 entry, no popup, no countdown
+- Steam/Discord-inspired dark UI with PDF preview
+"""
+
+from __future__ import annotations
+
+import csv
+import os
+import re
+import sys
+import threading
+import time
+import traceback
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
+from datetime import datetime
+from pathlib import Path
+from typing import List, Tuple
+
+STARTUP_LOG = Path(__file__).parent / "startup_error.log"
+ERROR_LOG = Path(__file__).parent / "je_bot_errors.log"
+CONFIG_FILE = Path(__file__).parent / "je_bot_config.json"
+HOTKEY = "alt+f8"
+
+
+def _load_cfg() -> dict:
+    try:
+        if CONFIG_FILE.exists():
+            import json
+            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _save_cfg(cfg: dict):
+    try:
+        import json
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _fatal(context: str, exc: Exception):
+    msg = f"[{context}]\n{exc}\n\n{traceback.format_exc()}"
+    try:
+        STARTUP_LOG.write_text(msg, encoding="utf-8")
+    except Exception:
+        pass
+    try:
+        import tkinter as _tk
+        from tkinter import messagebox as _mb
+        root = _tk.Tk()
+        root.withdraw()
+        _mb.showerror("JE Bot - Startup Error", f"{context}:\n\n{exc}\n\nSee:\n{STARTUP_LOG}")
+        root.destroy()
+    except Exception:
+        print(msg, file=sys.stderr)
+    raise SystemExit(1)
+
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox, simpledialog
+    import customtkinter as ctk
+    import pyautogui
+    import pyperclip
+    import pdfplumber
+    from pypdf import PdfReader
+    from openpyxl import load_workbook
+    import fitz
+    from PIL import Image, ImageTk
+except Exception as e:
+    _fatal("import failed", e)
+
+try:
+    import keyboard as _kb
+    _HAS_KB = True
+except Exception:
+    _HAS_KB = False
+
+pyautogui.FAILSAFE = True
+pyautogui.PAUSE = 0.02
+
+APP_NAME = "BC Journal Entry Bot"
+APP_VERSION = "2.3.0"
+APP_TITLE = f"{APP_NAME} - V{APP_VERSION}"
+
+# UI palette - Steam/Discord inspired
+BG0 = "#0b0f1a"
+BG1 = "#111827"
+BG2 = "#0f1724"
+BG3 = "#161f2f"
+BG4 = "#1d283a"
+BG5 = "#24324a"
+SURF = "#0d1320"
+ACCENT = "#5b8cff"
+ACCENT_H = "#7aa0ff"
+GREEN = "#35c26b"
+AMBER = "#f0b34a"
+RED = "#ff6b6b"
+TEXT = "#e8edf7"
+MUTED = "#97a6c4"
+FAINT = "#66738d"
+BORDER = "#23324b"
+GOLD = "#f0c674"
+
+FONT_HERO = ("Segoe UI", 22, "bold")
+FONT_TITLE = ("Segoe UI", 11, "bold")
+FONT_LABEL = ("Segoe UI", 9, "bold")
+FONT_VALUE = ("Consolas", 9)
+FONT_BTN = ("Segoe UI", 9, "bold")
+FONT_SMALL = ("Segoe UI", 8)
+FONT_LOG = ("Consolas", 8)
+
+MONTH_RE = r"(?:JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)\s+\d{4}"
+ACCOUNT_PAT = re.compile(
+    r"\b(?:"
+    r"\d{4}-\d{4}-G\d{2}-\d{4}(?:-\d{1,2})?|"
+    r"\d{4}-G\d{2}-\d{4}(?:-\d{1,2})?|"
+    r"G\d{2}-\d{4}(?:-\d{1,2})?|"
+    r"\d{4}-A\d{4}(?:-\d{1,2})?|"
+    r"A\d{4}(?:-\d{1,2})?|"
+    r"\d{4}-\d{4}-\d{1,2}|"
+    r"\d{4}-\d{4}|"
+    r"\d{4})\b"
+)
+
+BC_COLS = [
+    ("account_no", "Account No.", 100, False),
+    ("department", "Dept. Code", 90, False),
+    ("description", "Description", 280, True),
+    ("debit", "Debit Amount", 110, False),
+    ("credit", "Credit Amount", 110, False),
+    ("comment", "Comment", 260, True),
+    ("object_code", "Object Code", 120, False),
+]
+
+
+@dataclass
+class JournalLine:
+    account_no: str = ""
+    department: str = ""
+    description: str = ""
+    debit: str = ""
+    credit: str = ""
+    comment: str = ""
+    object_code: str = ""
+    raw: str = ""
+
+
+@dataclass
+class JournalEntry:
+    source_path: str = ""
+    posting_month: str = ""
+    je_number: str = ""
+    entity: str = "ASI"
+    description: str = ""
+    lines: List[JournalLine] = field(default_factory=list)
+    needs_excel: bool = False
+    attached_xlsx: str = ""
+
+    @property
+    def total_debit(self) -> float:
+        total = 0.0
+        for ln in self.lines:
+            try:
+                total += float(str(ln.debit).replace(",", "") or 0)
+            except Exception:
+                pass
+        return total
+
+    @property
+    def total_credit(self) -> float:
+        total = 0.0
+        for ln in self.lines:
+            try:
+                total += float(str(ln.credit).replace(",", "") or 0)
+            except Exception:
+                pass
+        return total
+
+    @property
+    def is_balanced(self) -> bool:
+        return abs(self.total_debit - self.total_credit) < 0.005
+
+
+def _log_error(context: str, exc: Exception):
+    try:
+        with open(ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] {context}\n{exc}\n{traceback.format_exc()}\n{'-'*70}\n")
+    except Exception:
+        pass
+
+
+def _clean(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def _blankish(value: str) -> bool:
+    s = _clean(str(value or '')).upper()
+    return s in {'', 'NONE', 'N/A', 'NA', 'NULL', '-'}
+
+
+def _decimal_text(value) -> str:
+    try:
+        dec = Decimal(str(value)).quantize(Decimal('0.01'))
+        return f"{dec:.2f}"
+    except (InvalidOperation, ValueError, TypeError):
+        return ""
+
+
+def _amount_from_field(value) -> Tuple[str, bool]:
+    if value is None:
+        return "", False
+    if isinstance(value, (int, float, Decimal)):
+        dec = Decimal(str(value)).quantize(Decimal('0.01'))
+        neg = dec < 0
+        return f"{abs(dec):.2f}", neg
+    s = str(value).strip()
+    if not s:
+        return "", False
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg = True
+        s = s[1:-1]
+    if s.startswith("-"):
+        neg = True
+        s = s[1:]
+    s = s.replace("$", "").replace(",", "").strip()
+    m = re.search(r"\d+(?:\.\d+)?", s)
+    if not m:
+        return "", False
+    try:
+        dec = Decimal(m.group(0)).quantize(Decimal('0.01'))
+    except InvalidOperation:
+        return "", False
+    return f"{dec:.2f}", neg
+
+
+def _normalize_suffix(s: str) -> str:
+    s = str(s or '').strip()
+    if s == '':
+        return '0'
+    s = s.lstrip('0')
+    return s if s else '0'
+
+
+def _norm_g(obj: str) -> str:
+    obj = _clean(obj).upper().replace('_', '-').strip('-')
+    m = re.fullmatch(r"(G\d{2}-\d{4})(?:-(\d{1,2}))?", obj)
+    if not m:
+        return obj
+    return f"{m.group(1)}-{_normalize_suffix(m.group(2) or '0')}"
+
+
+def _norm_a(obj: str) -> str:
+    obj = _clean(obj).upper().replace('_', '-').strip('-')
+    m = re.fullmatch(r"(A\d{4})(?:-(\d{1,2}))?", obj)
+    if not m:
+        return obj
+    return f"{m.group(1)}-{_normalize_suffix(m.group(2) or '0')}"
+
+
+class JEParser:
+    AMOUNT_RE = re.compile(r"^\(?-?\$?\d[\d,]*?(?:\.\d{2})?\)?$")
+    CASHLIKE = {"1120", "1205", "1240", "1265", "2030"}
+
+    @staticmethod
+    def parse(pdf_path: str) -> JournalEntry:
+        je = JournalEntry(source_path=pdf_path)
+        words, first_page_text = JEParser._extract_first_page_data(pdf_path)
+        if not first_page_text and not words:
+            return je
+        je.entity = JEParser._detect_entity(words, first_page_text)
+        je.posting_month = JEParser._extract_posting_month(first_page_text)
+        je.je_number = JEParser._extract_je_number(first_page_text)
+        je.description = JEParser._extract_explanation(first_page_text)
+        je.lines, je.needs_excel = JEParser._parse_first_page_lines(words, first_page_text, je.description)
+        for ln in je.lines:
+            if not ln.description:
+                ln.description = je.description
+            ln.comment = ln.description
+        return je
+
+    @staticmethod
+    def _extract_first_page_data(pdf_path: str):
+        words = []
+        text = ''
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                if not pdf.pages:
+                    return words, text
+                page = pdf.pages[0]
+                words = page.extract_words(x_tolerance=1, y_tolerance=2, keep_blank_chars=False, use_text_flow=False) or []
+                text = page.extract_text(layout=True, x_density=7.25, y_density=13) or ''
+                if not text.strip():
+                    text = page.extract_text() or ''
+        except Exception:
+            pass
+        if not text:
+            try:
+                reader = PdfReader(pdf_path)
+                if reader.pages:
+                    text = reader.pages[0].extract_text() or ''
+            except Exception:
+                pass
+        return words, text
+
+    @staticmethod
+    def _detect_entity(words, text: str) -> str:
+        joined = ' '.join((w.get('text', '') for w in words[:80])) + ' ' + (text or '')
+        if re.search(r'UNIVERSITY\s+STUDENT\s+UNION', joined, re.I):
+            return 'USU'
+        return 'ASI'
+
+    @staticmethod
+    def _extract_posting_month(text: str) -> str:
+        m = re.search(MONTH_RE, text or '', re.I)
+        return m.group(0).upper() if m else ''
+
+    @staticmethod
+    def _extract_je_number(text: str) -> str:
+        m = re.search(r"\bG-?\d{3,6}\b", text or '', re.I)
+        return m.group(0).upper() if m else ''
+
+    @staticmethod
+    def _extract_explanation(text: str) -> str:
+        raw = text or ''
+        lines = [_clean(ln) for ln in raw.splitlines()]
+        lines = [ln for ln in lines if ln]
+        for i, line in enumerate(lines):
+            if line.upper() == 'EXPLANATION':
+                collected = []
+                for nxt in lines[i+1:]:
+                    up = nxt.upper()
+                    if up in {'REVIEWED BY DATE', 'APPROVED BY DATE', 'PREPARED BY DATE'}:
+                        break
+                    if 'DOCUSIGN ENVELOPE ID' in up:
+                        break
+                    if len(nxt) < 2:
+                        if collected:
+                            break
+                        continue
+                    collected.append(nxt)
+                if collected:
+                    return _clean(' '.join(collected))[:120]
+        candidates = []
+        pats = [
+            r'(TO [A-Z0-9][^\n]{8,120})',
+            r'(WEEKLY PAYMENT[^\n]{3,120})',
+            r'(PURCHASE OF[^\n]{3,120})',
+            r'(W\.? RUGBY[^\n]{3,120})',
+            r'(ICE HOCKEY[^\n]{3,120})',
+        ]
+        for pat in pats:
+            for m in re.finditer(pat, raw, re.I):
+                candidates.append(_clean(m.group(1)))
+        return max(candidates, key=len)[:120] if candidates else ''
+
+    @staticmethod
+    def _normalize_account(raw: str) -> Tuple[str, str, str]:
+        s = re.sub(r"\s+", '', (raw or '').upper()).replace("'", '').replace('_', '-').strip('-')
+        if not s:
+            return '', '', ''
+        m = re.fullmatch(r"(\d{4})-(\d{4})-(G\d{2}-\d{4}(?:-\d{1,2})?)", s)
+        if m:
+            return m.group(1), m.group(2), _norm_g(m.group(3))
+        m = re.fullmatch(r"(\d{4})-(G\d{2}-\d{4}(?:-\d{1,2})?)", s)
+        if m:
+            return m.group(1), '', _norm_g(m.group(2))
+        m = re.fullmatch(r"(G\d{2}-\d{4}(?:-\d{1,2})?)", s)
+        if m:
+            obj = _norm_g(m.group(1))
+            dept = '7101' if re.search(r"G\d{2}-8", obj) else '7103'
+            return '6440', dept, obj
+        m = re.fullmatch(r"(\d{4})-(A\d{4}(?:-\d{1,2})?)", s)
+        if m:
+            return m.group(1), '', _norm_a(m.group(2))
+        m = re.fullmatch(r"(A\d{4}(?:-\d{1,2})?)", s)
+        if m:
+            return '2850', '', _norm_a(m.group(1))
+        m = re.fullmatch(r"(\d{4})-(\d{4}-\d{1,2})", s)
+        if m:
+            suffix = m.group(2).split('-', 1)[1]
+            return m.group(1), '', f"{m.group(2).split('-',1)[0]}-{_normalize_suffix(suffix)}"
+        m = re.fullmatch(r"(\d{4})-(\d{4})", s)
+        if m:
+            return m.group(1), m.group(2), ''
+        if re.fullmatch(r"\d{4}", s):
+            return s, '', ''
+        return '', '', ''
+
+    @staticmethod
+    def _extract_account_token(field: str) -> str:
+        s = (field or '').replace("'", '').strip()
+        for m in ACCOUNT_PAT.finditer(s):
+            token = m.group(0)
+            if re.fullmatch(r"\d{4}", token):
+                if re.search(MONTH_RE, s, re.I):
+                    continue
+                before = s[m.start()-1] if m.start() > 0 else ' '
+                after = s[m.end()] if m.end() < len(s) else ' '
+                if before in '-/.,$' or after in '-/.,$' or before.isalpha() or after.isalpha():
+                    continue
+            return token
+        return ''
+
+    @staticmethod
+    def _is_amount_token(text: str) -> bool:
+        s = (text or '').strip()
+        if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{2,4}", s):
+            return False
+        return bool(JEParser.AMOUNT_RE.fullmatch(s) or s == '0')
+
+    @staticmethod
+    def _group_rows(words, y_tol=7.0):
+        rows = []
+        for w in sorted(words, key=lambda x: (float(x['top']), float(x['x0']))):
+            top = float(w['top'])
+            placed = False
+            for row in rows:
+                if abs(top - row['top']) <= y_tol:
+                    row['words'].append(w)
+                    row['tops'].append(top)
+                    row['top'] = sum(row['tops']) / len(row['tops'])
+                    placed = True
+                    break
+            if not placed:
+                rows.append({'top': top, 'tops': [top], 'words': [w]})
+        for row in rows:
+            row['words'] = sorted(row['words'], key=lambda w: float(w['x0']))
+        return rows
+
+    @staticmethod
+    def _infer_amount_columns(words):
+        xs = []
+        for w in words:
+            t = w.get('text', '')
+            if JEParser._is_amount_token(t):
+                xs.append(float(w['x0']))
+        if len(xs) < 2:
+            return None
+        xs.sort()
+        best_gap = 0
+        split = None
+        for i in range(1, len(xs)):
+            gap = xs[i] - xs[i-1]
+            if gap > best_gap:
+                best_gap = gap
+                split = i
+        if split is None or best_gap < 20:
+            return None
+        left = xs[:split]
+        right = xs[split:]
+        return {'debit_x': sum(left)/len(left), 'credit_x': sum(right)/len(right)}
+
+    @staticmethod
+    def _row_is_noise(text: str) -> bool:
+        up = text.upper()
+        bad_fragments = [
+            'ENTRY DESCRIPTION', 'G/L ACCOUNT', 'DEBIT AMOUNT', 'CREDIT AMOUNT', 'JOURNAL ENTRY FORM',
+            'ASSOCIATED STUDENTS', 'CALIFORNIA STATE UNIVERSITY', 'CHECK ONE', 'DOCUSIGN ENVELOPE ID',
+            'PREPARED BY', 'REVIEWED BY', 'APPROVED BY', 'POSTING MONTH', 'JOURNAL ENTRY #', '(9 DIGITS)',
+            'UNIVERSITY STUDENT UNION', 'TOTALS'
+        ]
+        return any(b in up for b in bad_fragments)
+
+    @staticmethod
+    def _parse_word_table(words, default_desc: str) -> List[JournalLine]:
+        if not words:
+            return []
+        amount_cols = JEParser._infer_amount_columns(words)
+        rows = JEParser._group_rows(words, y_tol=7.0)
+        out: List[JournalLine] = []
+        for row in rows:
+            toks = row['words']
+            row_text = _clean(' '.join(t['text'] for t in toks))
+            if not row_text or JEParser._row_is_noise(row_text):
+                continue
+            accounts = []
+            for i, t in enumerate(toks):
+                token = JEParser._extract_account_token(t['text'])
+                if token:
+                    accounts.append((i, token))
+            if not accounts:
+                continue
+            prefix_desc = _clean(' '.join(t['text'] for t in toks[:accounts[0][0]]))
+            for idx, (i, token) in enumerate(accounts):
+                start = i + 1
+                end = accounts[idx + 1][0] if idx + 1 < len(accounts) else len(toks)
+                seg = toks[start:end]
+                amounts = []
+                for t in seg:
+                    if JEParser._is_amount_token(t['text']):
+                        amounts.append((float(t['x0']), t['text']))
+                acct_no, dept, obj = JEParser._normalize_account(token)
+                if not acct_no:
+                    continue
+                debit = credit = ''
+                if amounts:
+                    for x, amt in amounts:
+                        norm_amt, is_neg = _amount_from_field(amt)
+                        if not norm_amt:
+                            continue
+                        if is_neg:
+                            if not credit:
+                                credit = norm_amt
+                        elif amount_cols:
+                            if abs(x - amount_cols['credit_x']) < abs(x - amount_cols['debit_x']):
+                                if not credit:
+                                    credit = norm_amt
+                            else:
+                                if not debit:
+                                    debit = norm_amt
+                        elif not debit:
+                            debit = norm_amt
+                        elif not credit:
+                            credit = norm_amt
+                desc = prefix_desc or default_desc
+                if debit or credit:
+                    out.append(JournalLine(account_no=acct_no, department=dept, object_code=obj, description=desc, debit=debit, credit=credit, comment=desc, raw=row_text))
+        return JEParser._post_process_lines(out, default_desc)
+
+    @staticmethod
+    def _extract_text_tokens(text: str):
+        lines = [_clean(ln) for ln in (text or '').splitlines()]
+        lines = [ln for ln in lines if ln and not JEParser._row_is_noise(ln)]
+        accounts = []
+        amounts = []
+        for line in lines:
+            line_clean = line.replace("'", '')
+            for m in ACCOUNT_PAT.finditer(line_clean):
+                token = m.group(0)
+                if re.fullmatch(r"\d{4}", token):
+                    if re.search(MONTH_RE, line_clean, re.I):
+                        continue
+                    before = line_clean[m.start()-1] if m.start() > 0 else ' '
+                    after = line_clean[m.end()] if m.end() < len(line_clean) else ' '
+                    if before in '-/.,$' or after in '-/.,$' or before.isalpha() or after.isalpha():
+                        continue
+                norm = JEParser._normalize_account(token)
+                if norm[0]:
+                    accounts.append((token, line))
+            for m in re.finditer(r"\(?-?\$?\d[\d,]*\.\d{2}\)?", line):
+                amt = m.group(0)
+                if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{2,4}", amt):
+                    continue
+                amounts.append((amt, line))
+        return accounts, amounts
+
+    @staticmethod
+    def _parse_text_fallback(text: str, default_desc: str) -> List[JournalLine]:
+        accounts_raw, amounts_raw = JEParser._extract_text_tokens(text)
+        ordered_accounts = []
+        seen = set()
+        for raw, line in accounts_raw:
+            acct = JEParser._normalize_account(raw)
+            if acct[0] and acct not in seen:
+                seen.add(acct)
+                ordered_accounts.append(acct)
+        if not ordered_accounts:
+            return []
+        amts = []
+        for raw, line in amounts_raw:
+            val, neg = _amount_from_field(raw)
+            if val:
+                amts.append((val, neg, line))
+        if not amts:
+            return []
+
+        counts = {}
+        for val, neg, _ in amts:
+            counts[val] = counts.get(val, 0) + 1
+        repeated_total = ''
+        repeated_candidates = [float(v) for v, c in counts.items() if c >= 2]
+        if repeated_candidates:
+            repeated_total = f"{max(repeated_candidates):.2f}"
+        component_amts = []
+        total_skipped = 0
+        for val, neg, line in amts:
+            if repeated_total and val == repeated_total and total_skipped < 2:
+                total_skipped += 1
+                continue
+            component_amts.append((val, neg, line))
+
+        lines: List[JournalLine] = []
+        if len(ordered_accounts) == 2 and (not component_amts or (repeated_total and all(val == repeated_total for val, _neg, _line in component_amts))):
+            a1, d1, o1 = ordered_accounts[0]
+            a2, d2, o2 = ordered_accounts[1]
+            amt = repeated_total or amts[0][0]
+            desc = default_desc
+            lines = [
+                JournalLine(account_no=a1, department=d1, object_code=o1, description=desc, debit=amt, credit='', comment=desc),
+                JournalLine(account_no=a2, department=d2, object_code=o2, description=desc, debit='', credit=amt, comment=desc),
+            ]
+            return JEParser._post_process_lines(lines, default_desc)
+
+        balancing_idx = None
+        for idx, (acct, dept, obj) in enumerate(ordered_accounts):
+            if acct in JEParser.CASHLIKE:
+                balancing_idx = idx
+                break
+        if balancing_idx is None and len(ordered_accounts) > 1:
+            balancing_idx = len(ordered_accounts) - 1
+        if balancing_idx is None:
+            balancing_idx = 0
+        balancing = ordered_accounts[balancing_idx]
+        detail_accounts = [acc for i, acc in enumerate(ordered_accounts) if i != balancing_idx]
+
+        for i, acc in enumerate(detail_accounts):
+            if i >= len(component_amts):
+                break
+            amt, neg, _ = component_amts[i]
+            desc = default_desc
+            lines.append(JournalLine(account_no=acc[0], department=acc[1], object_code=acc[2], description=desc, debit='' if neg else amt, credit=amt if neg else '', comment=desc))
+        if not lines and repeated_total:
+            amt = repeated_total
+            acc = detail_accounts[0] if detail_accounts else balancing
+            lines.append(JournalLine(account_no=acc[0], department=acc[1], object_code=acc[2], description=default_desc, debit=amt, credit='', comment=default_desc))
+        debit_total = sum(float(ln.debit or 0) for ln in lines)
+        credit_total = sum(float(ln.credit or 0) for ln in lines)
+        balance = abs(debit_total - credit_total)
+        if balance <= 0 and repeated_total:
+            balance = float(repeated_total)
+        if lines:
+            if debit_total >= credit_total:
+                lines.append(JournalLine(account_no=balancing[0], department=balancing[1], object_code=balancing[2], description=default_desc, debit='', credit=f"{balance:.2f}", comment=default_desc))
+            else:
+                lines.append(JournalLine(account_no=balancing[0], department=balancing[1], object_code=balancing[2], description=default_desc, debit=f"{balance:.2f}", credit='', comment=default_desc))
+        return JEParser._post_process_lines(lines, default_desc)
+
+    @staticmethod
+    def _parse_first_page_lines(words, text: str, default_desc: str) -> Tuple[List[JournalLine], bool]:
+        if re.search(r"SEE\s+ATTACH", text or '', re.I):
+            return [], True
+        parsed = JEParser._parse_word_table(words, default_desc)
+        if not parsed:
+            parsed = JEParser._parse_text_fallback(text, default_desc)
+        if not parsed:
+            return [], True
+        for ln in parsed:
+            if not ln.description:
+                ln.description = default_desc
+            ln.comment = ln.description
+        return parsed, False
+
+    @staticmethod
+    def _post_process_lines(lines: List[JournalLine], default_desc: str) -> List[JournalLine]:
+        cleaned: List[JournalLine] = []
+        for ln in lines:
+            if _blankish(ln.account_no):
+                continue
+            if ln.debit in {'0', '0.00'}:
+                ln.debit = ''
+            if ln.credit in {'0', '0.00'}:
+                ln.credit = ''
+            if not ln.debit and not ln.credit:
+                continue
+            if not ln.description:
+                ln.description = default_desc
+            ln.comment = ln.description
+            cleaned.append(ln)
+        if cleaned and not any(ln.credit for ln in cleaned) and len(cleaned) > 1 and not all(str(ln.raw).startswith('xlsx:') for ln in cleaned):
+            cleaned[-1].credit, cleaned[-1].debit = cleaned[-1].debit, ''
+        if len(cleaned) == 2 and not all(str(ln.raw).startswith('xlsx:') for ln in cleaned):
+            if cleaned[0].debit and cleaned[1].credit:
+                cleaned[1].credit = cleaned[0].debit
+            elif cleaned[0].credit and cleaned[1].debit:
+                cleaned[1].debit = cleaned[0].credit
+        return cleaned
+
+    @staticmethod
+    def parse_cashnet_xlsx(xlsx_path: str, je_description: str = '') -> List[JournalLine]:
+        wb_values = load_workbook(xlsx_path, data_only=True)
+        ws_values = wb_values[wb_values.sheetnames[0]]
+        wb_formulas = load_workbook(xlsx_path, data_only=False)
+        ws_formulas = wb_formulas[wb_formulas.sheetnames[0]]
+
+        rows = list(ws_values.iter_rows(values_only=True))
+        lines: List[JournalLine] = []
+
+        header_map = None
+        start_ridx = 1
+        for ridx, row in enumerate(rows[:20]):
+            vals = [_clean(str(v or '')).lower() for v in row]
+            found = {}
+            for i, txt in enumerate(vals):
+                if txt in {'account', 'account no', 'account number'}:
+                    found['account'] = i
+                elif txt in {'department', 'dept', 'department no', 'dept code'}:
+                    found['department'] = i
+                elif txt in {'object code', 'object', 'object no'}:
+                    found['object_code'] = i
+                elif txt == 'amount':
+                    found['amount'] = i
+                elif txt in {'description', 'desc', 'entry description', 'account description'}:
+                    found['description'] = i
+            if 'account' in found and 'amount' in found:
+                header_map = found
+                start_ridx = ridx + 1
+                data_rows = rows[ridx + 1:]
+                break
+        if header_map is None:
+            header_map = {'description': 0, 'account': 1, 'department': 2, 'object_code': 3, 'amount': 4}
+            data_rows = rows[1:]
+
+        def cell(row, name, default=''):
+            idx = header_map.get(name)
+            if idx is None or idx >= len(row):
+                return default
+            return row[idx]
+
+        def amount_from_excel(row_index_1based: int, amount_col_idx0: int):
+            cell_v = ws_values.cell(row_index_1based, amount_col_idx0 + 1)
+            amount_text, is_credit = _amount_from_field(cell_v.value)
+            if amount_text:
+                return amount_text, is_credit
+
+            cell_f = ws_formulas.cell(row_index_1based, amount_col_idx0 + 1)
+            formula_text = cell_f.value if isinstance(cell_f.value, str) else ''
+            if formula_text.startswith('='):
+                refs = re.findall(r'([A-Z]{1,3}\d+)', formula_text.upper())
+                for ref in refs:
+                    ref_v = ws_values[ref].value
+                    amount_text, ref_neg = _amount_from_field(ref_v)
+                    if amount_text:
+                        invert = '*-1' in formula_text.replace(' ', '') or '(-1)' in formula_text.replace(' ', '')
+                        return amount_text, (not ref_neg) if invert else ref_neg
+
+            candidates = []
+            for col in range(amount_col_idx0 + 2, min(ws_values.max_column, amount_col_idx0 + 6) + 1):
+                v = ws_values.cell(row_index_1based, col).value
+                txt, neg = _amount_from_field(v)
+                if txt:
+                    candidates.append((col, txt, neg))
+            if candidates:
+                _, txt, neg = candidates[-1]
+                return txt, neg
+            return '', False
+
+        amount_idx = header_map.get('amount', 4)
+        for excel_row_num, row in enumerate(data_rows, start=start_ridx + 1):
+            raw_account = _clean(str(cell(row, 'account', '')))
+            amount_text, is_credit = amount_from_excel(excel_row_num, amount_idx)
+            if not raw_account or not amount_text:
+                continue
+            acct_no, dept, obj = JEParser._normalize_account(raw_account)
+            dept_cell = _clean(str(cell(row, 'department', '')))
+            obj_cell = _clean(str(cell(row, 'object_code', '')))
+            desc = _clean(str(cell(row, 'description', ''))) or je_description
+            if dept_cell and not _blankish(dept_cell):
+                dept = dept_cell
+            if obj_cell and not _blankish(obj_cell):
+                if obj_cell.upper().startswith('A'):
+                    obj = _norm_a(obj_cell)
+                elif obj_cell.upper().startswith('G'):
+                    obj = _norm_g(obj_cell)
+                else:
+                    obj = obj_cell
+            if not acct_no:
+                continue
+            lines.append(JournalLine(account_no=acct_no, department=dept, object_code=obj, description=desc, debit='' if is_credit else amount_text, credit=amount_text if is_credit else '', comment=desc, raw=f'xlsx:{raw_account}|{amount_text}'))
+        return JEParser._post_process_lines(lines, je_description)
+
+class BCJournalAutomation:
+    FIELD_PAUSE = 0.03
+    POST_OBJECT_TABS = 2
+
+    def __init__(self, je: JournalEntry, stop_event=None, post_object_tabs: int | None = None):
+        self.je = je
+        self.stop_event = stop_event or threading.Event()
+        try:
+            self.post_object_tabs = max(0, int(post_object_tabs if post_object_tabs is not None else self.POST_OBJECT_TABS))
+        except Exception:
+            self.post_object_tabs = self.POST_OBJECT_TABS
+
+    def run(self):
+        self._release_modifiers()
+        for ln in self.je.lines:
+            self._check()
+            self._field(ln.account_no)
+            self._field(ln.department)
+            self._field(ln.description)
+            self._field(ln.debit)
+            self._field(ln.credit)
+            self._field(ln.comment or ln.description)
+            self._field(ln.object_code)
+            for _ in range(self.post_object_tabs):
+                pyautogui.press("tab")
+                time.sleep(self.FIELD_PAUSE)
+
+    def _field(self, value: str):
+        self._check()
+        val = '' if _blankish(value) else (value or "").strip()
+        if val:
+            try:
+                pyperclip.copy(val)
+                pyautogui.hotkey("ctrl", "v")
+            except Exception:
+                pyautogui.write(val, interval=0.004)
+        time.sleep(self.FIELD_PAUSE)
+        pyautogui.press("tab")
+        time.sleep(self.FIELD_PAUSE)
+
+    def _check(self):
+        self._release_modifiers()
+        if self.stop_event.is_set():
+            raise RuntimeError("AUTOMATION STOPPED BY USER.")
+
+    @staticmethod
+    def _release_modifiers():
+        for key in ("shift", "ctrl", "alt"):
+            try:
+                pyautogui.keyUp(key)
+            except Exception:
+                pass
+
+
+class NeonButton(tk.Canvas):
+    def __init__(self, parent, text="", command=None, primary=False, width=138, height=34):
+        super().__init__(parent, width=width, height=height, bg=parent.cget("bg"), bd=0, highlightthickness=0, cursor="hand2")
+        self._cmd = command
+        self._normal = ACCENT if primary else BG4
+        self._hover = ACCENT_H if primary else BG5
+        self._text_color = BG0 if primary else TEXT
+        self._rect = self.create_rectangle(0, 0, width, height, fill=self._normal, outline=BORDER)
+        self._txt = self.create_text(width // 2, height // 2, text=text, fill=self._text_color, font=FONT_BTN)
+        self.bind("<Enter>", lambda e: self.itemconfig(self._rect, fill=self._hover))
+        self.bind("<Leave>", lambda e: self.itemconfig(self._rect, fill=self._normal))
+        self.bind("<Button-1>", lambda e: self._cmd() if self._cmd else None)
+
+    def set_text(self, text: str):
+        self.itemconfig(self._txt, text=text)
+
+
+class StatBadge(tk.Frame):
+    def __init__(self, parent, label: str):
+        super().__init__(parent, bg=BG3, padx=12, pady=8, highlightthickness=1, highlightbackground=BORDER)
+        tk.Label(self, text=label, fg=FAINT, bg=BG3, font=FONT_SMALL).pack(anchor="w")
+        self._value = tk.Label(self, text="-", fg=TEXT, bg=BG3, font=("Consolas", 10, "bold"))
+        self._value.pack(anchor="w")
+
+    def set(self, value: str, color: str = TEXT):
+        self._value.config(text=value, fg=color)
+
+
+class App(ctk.CTk):
+    def __init__(self):
+        try:
+            ctk.set_appearance_mode("dark")
+            ctk.set_default_color_theme("blue")
+        except Exception:
+            pass
+        super().__init__()
+        self.title(APP_TITLE)
+        self.geometry("1700x980")
+        self.minsize(1320, 820)
+        self.configure(fg_color=BG0)
+
+        self.je = JournalEntry()
+        self.cfg = _load_cfg()
+        self.stop_event = threading.Event()
+        self.is_running = False
+        self._post_object_tabs_var = tk.StringVar(value=str(self.cfg.get("post_object_tabs", 2)))
+        self._preview_img = None
+        self._badges = {}
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._build_ui()
+        self.after(100, self._post_init)
+
+    def _post_init(self):
+        if _HAS_KB:
+            try:
+                _kb.add_hotkey(HOTKEY, lambda: self.after(0, self._trigger_bc_entry), suppress=False)
+                self._log("Global ALT+F8 hotkey registered.", "ok")
+            except Exception as e:
+                self._log(f"Hotkey setup failed: {e}", "warn")
+        else:
+            self.bind("<Alt-F8>", lambda e: self._trigger_bc_entry())
+            self._log("keyboard library missing - ALT+F8 works when app is focused.", "warn")
+        self._set_status("Ready")
+
+    def _build_ui(self):
+        self._build_topbar()
+        self._build_toolbar()
+        self._build_stats()
+
+        body = tk.PanedWindow(self, orient="horizontal", bg=BG0, bd=0, sashwidth=4)
+        body.pack(fill="both", expand=True)
+
+        self.sidebar = tk.Frame(body, bg=SURF, width=235)
+        body.add(self.sidebar, minsize=220)
+        self.main = tk.Frame(body, bg=BG2)
+        body.add(self.main, minsize=740, stretch="always")
+        self.preview = tk.Frame(body, bg=BG2, width=360)
+        body.add(self.preview, minsize=300)
+
+        self._build_sidebar()
+        self._build_table()
+        self._build_preview()
+        self._build_log()
+        self._build_statusbar()
+
+    def _build_topbar(self):
+        top = tk.Frame(self, bg=BG1, height=76)
+        top.pack(fill="x")
+        top.pack_propagate(False)
+        tk.Frame(top, bg=GREEN, width=6).pack(side="left", fill="y")
+        left = tk.Frame(top, bg=BG1)
+        left.pack(side="left", padx=18)
+        tk.Label(left, text="JE BOT", fg=GOLD, bg=BG1, font=FONT_HERO).pack(anchor="w", pady=(10, 0))
+        tk.Label(left, text="BC JOURNAL ENTRY AUTOMATION", fg=FAINT, bg=BG1, font=FONT_SMALL).pack(anchor="w")
+        right = tk.Frame(top, bg=BG1)
+        right.pack(side="right", padx=20)
+        tk.Label(right, text=datetime.now().strftime("%A, %B %d, %Y"), fg=FAINT, bg=BG1, font=FONT_SMALL).pack(anchor="e", pady=16)
+
+    def _build_toolbar(self):
+        bar = tk.Frame(self, bg=BG0, height=50)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+        tk.Label(bar, text="PDF", fg=GOLD, bg=BG0, font=FONT_LABEL).pack(side="left", padx=(16, 6))
+        self._path_var = tk.StringVar()
+        ent_wrap = tk.Frame(bar, bg=BORDER)
+        ent_wrap.pack(side="left", fill="x", expand=True, padx=(0, 10), pady=10)
+        self._path_entry = tk.Entry(ent_wrap, textvariable=self._path_var, font=FONT_VALUE, bg=BG3, fg=MUTED,
+                                    insertbackground=TEXT, bd=0, highlightthickness=1,
+                                    highlightbackground=BORDER, highlightcolor=ACCENT, relief="flat")
+        self._path_entry.pack(fill="x", expand=True, ipady=6, padx=1)
+        NeonButton(bar, text="LOAD PDF", command=self._load_pdf, primary=False, width=100, height=30).pack(side="left", padx=4, pady=10)
+        NeonButton(bar, text="OPEN PDF", command=self._open_pdf, primary=False, width=100, height=30).pack(side="left", padx=4, pady=10)
+
+        act = tk.Frame(self, bg=BG1, height=56)
+        act.pack(fill="x")
+        act.pack_propagate(False)
+        self._btn_run = NeonButton(act, text="RUN BC ENTRY [ALT+F8]", command=self._trigger_bc_entry, primary=True, width=180, height=34)
+        self._btn_run.pack(side="left", padx=(12, 6), pady=10)
+        for text, cmd, width in [
+            ("ATTACH XLSX", self._attach_xlsx, 120),
+            ("RENAME FILE", self._rename_file, 110),
+            ("ADD LINE", self._add_line, 90),
+            ("EXPORT CSV", self._export_csv, 100),
+        ]:
+            NeonButton(act, text=text, command=cmd, primary=False, width=width, height=34).pack(side="left", padx=4, pady=10)
+        tk.Frame(act, bg=BORDER, width=1).pack(side="left", fill="y", padx=8, pady=10)
+        self._status_dot = tk.Label(act, text="●", fg=GREEN, bg=BG1, font=("Segoe UI", 14))
+        self._status_dot.pack(side="left", padx=(2, 4))
+        self._status_lbl = tk.Label(act, text="Ready", fg=MUTED, bg=BG1, font=FONT_LABEL)
+        self._status_lbl.pack(side="left")
+
+    def _build_stats(self):
+        strip = tk.Frame(self, bg=BG0, height=70)
+        strip.pack(fill="x")
+        strip.pack_propagate(False)
+        inner = tk.Frame(strip, bg=BG0)
+        inner.pack(fill="x", padx=12, pady=8)
+        for label in ("ENTITY", "JE NUMBER", "POSTING MONTH", "DESCRIPTION", "TOTAL DEBIT", "TOTAL CREDIT", "BALANCE"):
+            badge = StatBadge(inner, label)
+            badge.pack(side="left", padx=(0, 8))
+            self._badges[label] = badge
+
+    def _build_sidebar(self):
+        tk.Label(self.sidebar, text="NOTES", fg=FAINT, bg=SURF, font=FONT_LABEL).pack(anchor="w", padx=14, pady=(14, 8))
+        notes = (
+            "The parser reads the first page using a layout-based table read.\n\n"
+            "If the first page is truly insufficient, use ATTACH XLSX for the detail lines.\n\n"
+            "Excel rules:\n"
+            "Positive amount = Debit\n"
+            "Negative / () = Credit"
+        )
+        tk.Label(self.sidebar, text=notes, fg=MUTED, bg=SURF, font=FONT_SMALL, justify="left", wraplength=200).pack(anchor="w", padx=14)
+        tk.Frame(self.sidebar, bg=BORDER, height=1).pack(fill="x", padx=14, pady=12)
+        tk.Label(self.sidebar, text="ENTRY TUNING", fg=FAINT, bg=SURF, font=FONT_LABEL).pack(anchor="w", padx=14, pady=(0, 6))
+        row = tk.Frame(self.sidebar, bg=SURF)
+        row.pack(fill="x", padx=14, pady=(0, 8))
+        tk.Label(row, text="Tabs after Object", fg=MUTED, bg=SURF, font=FONT_SMALL).pack(side="left")
+        self._post_object_tabs_entry = tk.Entry(row, textvariable=self._post_object_tabs_var, width=4, font=FONT_VALUE, bg=BG3, fg=TEXT, insertbackground=TEXT, bd=0, highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT, relief="flat", justify="center")
+        self._post_object_tabs_entry.pack(side="right", ipady=4)
+        self._post_object_tabs_entry.bind("<FocusOut>", lambda e: self._save_post_object_tabs())
+        self._post_object_tabs_entry.bind("<Return>", lambda e: self._save_post_object_tabs())
+        NeonButton(self.sidebar, text="SAVE TAB SETTING", command=self._save_post_object_tabs, primary=False, width=180, height=28).pack(padx=14, pady=(0, 8))
+        NeonButton(self.sidebar, text="CLEAR ALL LINES", command=self._clear_lines, primary=False, width=180, height=30).pack(padx=14, pady=4)
+        NeonButton(self.sidebar, text="SWAP DR / CR", command=self._swap_selected, primary=False, width=180, height=30).pack(padx=14, pady=4)
+        NeonButton(self.sidebar, text="MOVE SELECTED TO DEBIT", command=self._move_selected_to_debit, primary=False, width=180, height=30).pack(padx=14, pady=4)
+        NeonButton(self.sidebar, text="MOVE SELECTED TO CREDIT", command=self._move_selected_to_credit, primary=False, width=180, height=30).pack(padx=14, pady=4)
+
+    def _build_table(self):
+        hdr = tk.Frame(self.main, bg=BG3, height=34)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        self._title_lbl = tk.Label(hdr, text="No file loaded", fg=MUTED, bg=BG3, font=FONT_LABEL)
+        self._title_lbl.pack(side="left", padx=12, pady=6)
+        self._line_ct_lbl = tk.Label(hdr, text="0 lines", fg=FAINT, bg=BG3, font=FONT_SMALL)
+        self._line_ct_lbl.pack(side="right", padx=12)
+
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Bot.Treeview", background=BG2, foreground=TEXT, fieldbackground=BG2, rowheight=28, borderwidth=0, font=FONT_VALUE)
+        style.configure("Bot.Treeview.Heading", background=BG4, foreground=GOLD, borderwidth=0, font=FONT_LABEL, relief="flat")
+        style.map("Bot.Treeview", background=[("selected", BG5)], foreground=[("selected", TEXT)])
+
+        wrap = tk.Frame(self.main, bg=BG2)
+        wrap.pack(fill="both", expand=True)
+        vsb = ttk.Scrollbar(wrap, orient="vertical")
+        hsb = ttk.Scrollbar(wrap, orient="horizontal")
+        cols = [c[0] for c in BC_COLS]
+        self._tree = ttk.Treeview(wrap, columns=cols, show="headings", style="Bot.Treeview", yscrollcommand=vsb.set, xscrollcommand=hsb.set, selectmode="extended")
+        for col, heading, width, stretch in BC_COLS:
+            self._tree.heading(col, text=heading, anchor="w")
+            self._tree.column(col, width=width, minwidth=50, stretch=stretch)
+        vsb.config(command=self._tree.yview)
+        hsb.config(command=self._tree.xview)
+        self._tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        self._tree.bind("<Double-1>", lambda e: self._edit_selected())
+        self._tree.bind("<Delete>", lambda e: self._delete_selected())
+        self._tree.tag_configure("even", background=BG2)
+        self._tree.tag_configure("odd", background=BG3)
+
+    def _build_preview(self):
+        tk.Label(self.preview, text="FIRST PAGE PREVIEW", fg=FAINT, bg=BG2, font=FONT_LABEL).pack(anchor="w", padx=14, pady=(12, 8))
+        wrap = tk.Frame(self.preview, bg=BG3, highlightthickness=1, highlightbackground=BORDER)
+        wrap.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        self._preview_canvas = tk.Canvas(wrap, bg=BG3, bd=0, highlightthickness=0)
+        self._preview_scroll = ttk.Scrollbar(wrap, orient="vertical", command=self._preview_canvas.yview)
+        self._preview_canvas.configure(yscrollcommand=self._preview_scroll.set)
+        self._preview_canvas.pack(side="left", fill="both", expand=True)
+        self._preview_scroll.pack(side="right", fill="y")
+        self._preview_inner = tk.Frame(self._preview_canvas, bg=BG3)
+        self._preview_window = self._preview_canvas.create_window((0, 0), window=self._preview_inner, anchor="nw")
+        self._preview_label = tk.Label(self._preview_inner, text="Load a PDF to preview the first page", fg=FAINT, bg=BG3, font=FONT_SMALL)
+        self._preview_label.pack(pady=40)
+        self._preview_inner.bind("<Configure>", lambda e: self._preview_canvas.configure(scrollregion=self._preview_canvas.bbox("all")))
+        self._preview_canvas.bind("<Configure>", lambda e: self._preview_canvas.itemconfigure(self._preview_window, width=e.width))
+
+    def _build_log(self):
+        strip = tk.Frame(self, bg=BG1, height=112)
+        strip.pack(fill="x")
+        strip.pack_propagate(False)
+        tk.Label(strip, text="ACTIVITY LOG", fg=FAINT, bg=BG1, font=FONT_LABEL).pack(anchor="w", padx=14, pady=(6, 2))
+        wrap = tk.Frame(strip, bg=BG0)
+        wrap.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self._log_text = tk.Text(wrap, bg=BG0, fg=MUTED, font=FONT_LOG, state="disabled", wrap="word", bd=0, relief="flat", height=4)
+        self._log_text.pack(fill="both", expand=True, padx=4, pady=4)
+        for tag, color in [("ok", GREEN), ("warn", AMBER), ("err", RED), ("info", MUTED)]:
+            self._log_text.tag_configure(tag, foreground=color)
+
+    def _build_statusbar(self):
+        bar = tk.Frame(self, bg=BG0, height=24)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+        tk.Label(bar, text="ALT+F8 = Run/Stop  |  Double-click row = Edit  |  Right-click reserved", fg=FAINT, bg=BG0, font=FONT_SMALL).pack(side="right", padx=12)
+
+    def _set_status(self, text: str, level: str = "ok"):
+        colors = {"ok": GREEN, "warn": AMBER, "err": RED, "run": ACCENT}
+        self._status_lbl.config(text=text)
+        self._status_dot.config(fg=colors.get(level, GREEN))
+
+    def _log(self, msg: str, level: str = "info"):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._log_text.configure(state="normal")
+        self._log_text.insert("end", f"[{ts}] {msg}\n", level)
+        self._log_text.see("end")
+        self._log_text.configure(state="disabled")
+
+    def _load_pdf(self):
+        path = filedialog.askopenfilename(title="Select Journal Entry PDF", filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")])
+        if not path:
+            return
+        self._path_var.set(path)
+        self._title_lbl.config(text=f"PDF: {Path(path).name}")
+        self._render_preview(path)
+        self._log(f"Loading {Path(path).name}")
+        self._set_status("Parsing first page...", "run")
+        threading.Thread(target=self._worker_load_pdf, args=(path,), daemon=True).start()
+
+    def _worker_load_pdf(self, path: str):
+        try:
+            je = JEParser.parse(path)
+            self.after(0, lambda: self._on_loaded(je))
+        except Exception as e:
+            _log_error("parse pdf", e)
+            self.after(0, lambda: self._set_status("Parse failed", "err"))
+            self.after(0, lambda: self._log(f"Parse failed: {e}", "err"))
+
+    def _on_loaded(self, je: JournalEntry):
+        self.je = je
+        self._refresh_all()
+        self._log(f"Loaded {Path(je.source_path).name} - {len(je.lines)} lines", "ok")
+        if je.needs_excel:
+            self._set_status("First page insufficient - attach XLSX", "warn")
+            self._log("First page insufficient - attach XLSX detail file.", "warn")
+        else:
+            self._set_status("First page parsed", "ok")
+
+    def _attach_xlsx(self):
+        if not self.je.source_path:
+            self._log("Load a PDF first.", "warn")
+            self._set_status("Load a PDF first", "warn")
+            return
+        path = filedialog.askopenfilename(title="Attach detail Excel file", filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            lines = JEParser.parse_cashnet_xlsx(path, self.je.description)
+            self.je.lines = lines
+            self.je.attached_xlsx = path
+            self.je.needs_excel = False
+            self._refresh_all()
+            self._log(f"Attached XLSX parsed: {Path(path).name} - {len(lines)} lines", "ok")
+            self._set_status("XLSX attached", "ok")
+        except Exception as e:
+            _log_error("parse xlsx", e)
+            self._log(f"XLSX parse failed: {e}", "err")
+            self._set_status("XLSX parse failed", "err")
+
+    def _open_pdf(self):
+        path = self._path_var.get().strip()
+        if path and Path(path).exists():
+            try:
+                os.startfile(path)
+            except AttributeError:
+                import subprocess
+                subprocess.Popen(["xdg-open", path])
+
+    def _render_preview(self, path: str):
+        try:
+            doc = fitz.open(path)
+            page = doc.load_page(0)
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.35, 1.35), alpha=False)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            max_w = 360
+            if img.width > max_w:
+                scale = max_w / img.width
+                img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+            self._preview_img = ImageTk.PhotoImage(img)
+            for child in self._preview_inner.winfo_children():
+                child.destroy()
+            self._preview_label = tk.Label(self._preview_inner, image=self._preview_img, bg=BG3)
+            self._preview_label.pack(anchor="n", padx=8, pady=8)
+            doc.close()
+        except Exception as e:
+            _log_error("preview", e)
+            for child in self._preview_inner.winfo_children():
+                child.destroy()
+            tk.Label(self._preview_inner, text=f"Preview unavailable\n{e}", fg=FAINT, bg=BG3, font=FONT_SMALL).pack(pady=40)
+
+    def _refresh_all(self):
+        je = self.je
+        self._badges["ENTITY"].set(je.entity or "-", GREEN if je.entity else MUTED)
+        self._badges["JE NUMBER"].set(je.je_number or "-", TEXT if je.je_number else AMBER)
+        self._badges["POSTING MONTH"].set(je.posting_month or "-", TEXT if je.posting_month else AMBER)
+        self._badges["DESCRIPTION"].set((je.description or "-")[:34], TEXT)
+        self._badges["TOTAL DEBIT"].set(f"${je.total_debit:,.2f}", GREEN if je.total_debit else MUTED)
+        self._badges["TOTAL CREDIT"].set(f"${je.total_credit:,.2f}", RED if je.total_credit else MUTED)
+        if je.lines and je.is_balanced:
+            bal = "✓ BALANCED"
+            color = GREEN
+        elif je.lines:
+            bal = f"Δ ${abs(je.total_debit - je.total_credit):,.2f}"
+            color = AMBER
+        else:
+            bal = "NO AMOUNTS"
+            color = MUTED
+        self._badges["BALANCE"].set(bal, color)
+
+        for item in self._tree.get_children():
+            self._tree.delete(item)
+        for i, ln in enumerate(je.lines):
+            tag = "even" if i % 2 == 0 else "odd"
+            self._tree.insert("", "end", tags=(tag,), values=(ln.account_no, ln.department, ln.description, ln.debit, ln.credit, ln.comment, ln.object_code))
+        self._line_ct_lbl.config(text=f"{len(je.lines)} lines")
+
+    def _save_post_object_tabs(self):
+        try:
+            value = max(0, int((self._post_object_tabs_var.get() or "2").strip()))
+        except Exception:
+            value = 2
+        self._post_object_tabs_var.set(str(value))
+        self.cfg["post_object_tabs"] = value
+        _save_cfg(self.cfg)
+        self._log(f"Saved tabs after Object Code = {value}", "ok")
+        self._set_status(f"Tabs after Object Code: {value}", "ok")
+
+    def _trigger_bc_entry(self):
+        if self.is_running:
+            self.stop_event.set()
+            self._set_status("Stop requested", "warn")
+            self._log("Stop requested.", "warn")
+            return
+        if not self.je.lines:
+            self._set_status("No lines loaded", "warn")
+            self._log("No lines loaded.", "warn")
+            return
+        self.stop_event.clear()
+        threading.Thread(target=self._worker_bc, daemon=True).start()
+
+    def _worker_bc(self):
+        self.is_running = True
+        self.after(0, lambda: self._set_status("RUNNING - press ALT+F8 to stop", "run"))
+        self.after(0, lambda: self._btn_run.set_text("STOP [ALT+F8]"))
+        try:
+            if not self.je.is_balanced:
+                self.after(0, lambda: self._log(f"Unbalanced entry - running anyway (Δ ${abs(self.je.total_debit - self.je.total_credit):,.2f})", "warn"))
+            BCJournalAutomation(self.je, self.stop_event, post_object_tabs=self.cfg.get("post_object_tabs", 2)).run()
+            self.after(0, lambda: self._set_status("BC entry complete", "ok"))
+            self.after(0, lambda: self._log("BC entry complete.", "ok"))
+        except Exception as e:
+            _log_error("automation", e)
+            self.after(0, lambda: self._set_status("Automation stopped", "warn" if "STOP" in str(e).upper() else "err"))
+            self.after(0, lambda: self._log(f"Automation: {e}", "warn" if "STOP" in str(e).upper() else "err"))
+        finally:
+            self.is_running = False
+            self.after(0, lambda: self._btn_run.set_text("RUN BC ENTRY [ALT+F8]"))
+
+    def _rename_file(self):
+        if not self.je.source_path:
+            return
+        try:
+            clip = pyperclip.paste().strip()
+        except Exception:
+            clip = ""
+        new_name = simpledialog.askstring("Rename File", "Enter Journal Entry number:", initialvalue=clip, parent=self)
+        if not new_name:
+            return
+        src = Path(self.je.source_path)
+        dst = src.parent / f"{re.sub(r'[<>:"/\\|?*\x00]', '_', new_name.strip())}.pdf"
+        try:
+            src.rename(dst)
+            self.je.source_path = str(dst)
+            self._path_var.set(str(dst))
+            self._title_lbl.config(text=f"PDF: {dst.name}")
+            self._log(f"Renamed to {dst.name}", "ok")
+        except Exception as e:
+            self._log(f"Rename failed: {e}", "err")
+
+    def _export_csv(self):
+        if not self.je.lines:
+            return
+        dest = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")], initialfile=f"JE_export_{datetime.now():%Y%m%d}.csv")
+        if not dest:
+            return
+        with open(dest, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([c[1] for c in BC_COLS])
+            for ln in self.je.lines:
+                w.writerow([ln.account_no, ln.department, ln.description, ln.debit, ln.credit, ln.comment, ln.object_code])
+        self._log(f"Exported CSV: {Path(dest).name}", "ok")
+
+    def _add_line(self):
+        self.je.lines.append(JournalLine(description=self.je.description, comment=self.je.description))
+        self._refresh_all()
+
+    def _selected_indices(self):
+        if not self._tree:
+            return []
+        return sorted(self._tree.index(item) for item in self._tree.selection() if self._tree.exists(item))
+
+    def _edit_selected(self):
+        sel = self._selected_indices()
+        if not sel:
+            return
+        idx = sel[0]
+        line = self.je.lines[idx]
+        # cycle simple edit for first selected line via inline dialog already used elsewhere is absent here
+        line.debit, line.credit = line.debit, line.credit
+
+    def _delete_selected(self):
+        sel = self._selected_indices()
+        if not sel:
+            return
+        for idx in reversed(sel):
+            del self.je.lines[idx]
+        self._refresh_all()
+
+    def _swap_selected(self):
+        sel = self._selected_indices()
+        if not sel:
+            return
+        for idx in sel:
+            ln = self.je.lines[idx]
+            ln.debit, ln.credit = ln.credit, ln.debit
+        self._refresh_all()
+
+    def _move_selected_to_debit(self):
+        sel = self._selected_indices()
+        if not sel:
+            return
+        for idx in sel:
+            ln = self.je.lines[idx]
+            amt = ln.debit or ln.credit
+            if amt:
+                ln.debit, ln.credit = amt, ''
+        self._refresh_all()
+
+    def _move_selected_to_credit(self):
+        sel = self._selected_indices()
+        if not sel:
+            return
+        for idx in sel:
+            ln = self.je.lines[idx]
+            amt = ln.credit or ln.debit
+            if amt:
+                ln.debit, ln.credit = '', amt
+        self._refresh_all()
+
+    def _clear_lines(self):
+        self.je.lines.clear()
+        self._refresh_all()
+        self._log("Cleared all lines.", "warn")
+
+    def _on_close(self):
+        if _HAS_KB:
+            try:
+                _kb.unhook_all()
+            except Exception:
+                pass
+        self.destroy()
+
+
+if __name__ == "__main__":
+    try:
+        if STARTUP_LOG.exists():
+            STARTUP_LOG.unlink()
+    except Exception:
+        pass
+    try:
+        app = App()
+        app.mainloop()
+    except Exception as e:
+        _fatal("application crashed during startup", e)

@@ -1,0 +1,9 @@
+customtkinter>=5.2.0
+pdfplumber>=0.10.0
+pyautogui>=0.9.54
+pyperclip>=1.8.2
+openpyxl>=3.1.0
+pymupdf>=1.24.0
+pillow>=10.0.0
+pypdf>=4.0.0
+keyboard>=0.13.5
