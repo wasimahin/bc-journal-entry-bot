@@ -136,7 +136,7 @@ When the PDF's first page is insufficient, attach the CashNet Excel detail file:
 
 ## Project Context
 
-Built independently as part of my role as **Lead Business Office Representative at ASI CSULB**, where I oversee financial documentation for 500+ registered campus organizations. This tool is one of two production Python automation systems I engineered for the office — the other being the **[Snehin Check Request Helper](https://github.com/wasimahin/snehin-check-request-helper)**.
+Built independently in the Business Office at **Associated Students, Inc. (ASI), CSULB**, which keeps the books for ASI and the University Student Union and serves 500+ registered campus organizations. As the office's **Financial Systems Assistant**, I maintain it in daily use. It is one of two production Python automation tools I built for the office — the other being the **[Snehin Check Request Helper](https://github.com/wasimahin/snehin-check-request-helper)**.
 
 Both tools run live with zero API integration, operating entirely through UI automation against Microsoft Dynamics 365 Business Central.
 
@@ -145,5 +145,6 @@ Both tools run live with zero API integration, operating entirely through UI aut
 ## Author
 
 **Wasi Mahin**  
-Dual-Major: Management Information Systems & Accountancy | CSULB  
+Financial Systems Assistant, Associated Students, Inc., CSULB  
+B.S. Management Information Systems & Accountancy, CSULB (May 2027)  
 [LinkedIn](https://linkedin.com/in/wasi-mahin) · [GitHub](https://github.com/wasimahin) · wasimahin@gmail.com
